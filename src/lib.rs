@@ -179,7 +179,7 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
                             break;
                         }
                         // no configs found or looking for configs failed:
-                        Err(ConfigFetchIssue::NoConfigFound) | Ok(_) => {
+                        Err(ConfigFetchIssue::NoConfigFound(repo_url)) | Ok(_) => {
                             tx.send(Message::Finished(None)).unwrap();
                             break;
                         }
@@ -194,6 +194,7 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
                         }
                         Err(e) => {
                             let msg = match e {
+                                ConfigFetchIssue::NoConfigFound(s) => s,
                                 ConfigFetchIssue::BadRepoUrl(s) => s,
                                 ConfigFetchIssue::GitFail(e) => e.to_string(),
                                 ConfigFetchIssue::Http(e) => e.to_string(),
@@ -263,7 +264,7 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
 /// RateLimit means we need to wait and retry, other things are errors we report
 #[derive(Debug)]
 enum ConfigFetchIssue {
-    NoConfigFound,
+    NoConfigFound(String),
     NonEmptyTargetDir(PathBuf),
     RateLimit(usize),
     BadRepoUrl(String),
@@ -290,7 +291,7 @@ fn config_files_and_rev_for_repo(
         let config_from_http =
             config_file_and_rev_from_remote_http(repo_url).map(|(p, rev)| (vec![p], rev));
         // if not found, try checking out and looking; otherwise return the result
-        if !matches!(config_from_http, Err(ConfigFetchIssue::NoConfigFound)) {
+        if !matches!(config_from_http, Err(ConfigFetchIssue::NoConfigFound(repo_url))) {
             return config_from_http;
         }
     }
@@ -345,7 +346,7 @@ fn config_file_from_remote_http(repo_url: &str) -> Result<PathBuf, ConfigFetchIs
             }
         }
     }
-    Err(ConfigFetchIssue::NoConfigFound)
+    Err(ConfigFetchIssue::NoConfigFound(repo_url.to_string()))
 }
 
 fn config_files_from_local_checkout(
@@ -362,7 +363,7 @@ fn config_files_from_local_checkout(
     }
     let configs: Vec<_> = iter_config_paths(local_repo_dir)?.collect();
     if configs.is_empty() {
-        Err(ConfigFetchIssue::NoConfigFound)
+        Err(ConfigFetchIssue::NoConfigFound(repo_url))
     } else {
         Ok(configs)
     }
@@ -384,8 +385,8 @@ fn iter_config_paths(font_dir: &Path) -> Result<impl Iterator<Item = PathBuf>, C
         stem.starts_with("config") && (extension == "yaml" || extension == "yml")
     }
 
-    let sources_dir = find_sources_dir(font_dir).ok_or(ConfigFetchIssue::NoConfigFound)?;
-    let contents = std::fs::read_dir(sources_dir).map_err(|_| ConfigFetchIssue::NoConfigFound)?;
+    let sources_dir = find_sources_dir(font_dir).ok_or(ConfigFetchIssue::NoConfigFound(repo_url))?;
+    let contents = std::fs::read_dir(sources_dir).map_err(|_| ConfigFetchIssue::NoConfigFound(repo_url))?;
     Ok(contents
         .filter_map(|entry| entry.ok().map(|e| PathBuf::from(e.file_name())))
         .filter(looks_like_config_file))
@@ -578,9 +579,11 @@ mod tests {
         assert!(
             config_file_and_rev_from_remote_http("https://github.com/PaoloBiagini/Joan").is_ok()
         );
+
+        let repo_url="https://github.com/googlefonts/bangers";
         assert!(matches!(
-            config_file_and_rev_from_remote_http("https://github.com/googlefonts/bangers"),
-            Err(ConfigFetchIssue::NoConfigFound)
+            config_file_and_rev_from_remote_http(repo_url),
+            Err(ConfigFetchIssue::NoConfigFound(repo_url))
         ));
     }
 
