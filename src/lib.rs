@@ -179,7 +179,15 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
                             break;
                         }
                         // no configs found or looking for configs failed:
-                        Err(ConfigFetchIssue::NoConfigFound(repo_url)) | Ok(_) => {
+                        Err(ConfigFetchIssue::NoConfigFound(repo_url)) => {
+                            tx.send(Message::ErrorMsg {
+                                repo_url,
+                                msg: "No config found".to_string(),
+                            })
+                            .unwrap();
+                            break;
+                        }
+                        Ok(_) => {
                             tx.send(Message::Finished(None)).unwrap();
                             break;
                         }
@@ -291,7 +299,7 @@ fn config_files_and_rev_for_repo(
         let config_from_http =
             config_file_and_rev_from_remote_http(repo_url).map(|(p, rev)| (vec![p], rev));
         // if not found, try checking out and looking; otherwise return the result
-        if !matches!(config_from_http, Err(ConfigFetchIssue::NoConfigFound(repo_url))) {
+        if !matches!(config_from_http, Err(ConfigFetchIssue::NoConfigFound(_))) {
             return config_from_http;
         }
     }
@@ -361,9 +369,9 @@ fn config_files_from_local_checkout(
         std::fs::create_dir_all(local_repo_dir).unwrap();
         clone_repo(repo_url, local_repo_dir).map_err(ConfigFetchIssue::GitFail)?;
     }
-    let configs: Vec<_> = iter_config_paths(local_repo_dir)?.collect();
+    let configs: Vec<_> = iter_config_paths(local_repo_dir, repo_url)?.collect();
     if configs.is_empty() {
-        Err(ConfigFetchIssue::NoConfigFound(repo_url))
+        Err(ConfigFetchIssue::NoConfigFound(repo_url.to_string()))
     } else {
         Ok(configs)
     }
@@ -374,7 +382,10 @@ fn config_files_from_local_checkout(
 /// This will look for all files that begin with 'config' and have either the
 /// 'yaml' or 'yml' extension; if multiple files match this pattern it will
 /// return the one with the shortest name.
-fn iter_config_paths(font_dir: &Path) -> Result<impl Iterator<Item = PathBuf>, ConfigFetchIssue> {
+fn iter_config_paths(
+    font_dir: &Path,
+    repo_url: &str,
+) -> Result<impl Iterator<Item = PathBuf>, ConfigFetchIssue> {
     #[allow(clippy::ptr_arg)] // we don't use &Path so we can pass this to a closure below
     fn looks_like_config_file(path: &PathBuf) -> bool {
         let (Some(stem), Some(extension)) =
@@ -385,8 +396,10 @@ fn iter_config_paths(font_dir: &Path) -> Result<impl Iterator<Item = PathBuf>, C
         stem.starts_with("config") && (extension == "yaml" || extension == "yml")
     }
 
-    let sources_dir = find_sources_dir(font_dir).ok_or(ConfigFetchIssue::NoConfigFound(repo_url))?;
-    let contents = std::fs::read_dir(sources_dir).map_err(|_| ConfigFetchIssue::NoConfigFound(repo_url))?;
+    let sources_dir =
+        find_sources_dir(font_dir).ok_or(ConfigFetchIssue::NoConfigFound(repo_url.to_string()))?;
+    let contents = std::fs::read_dir(sources_dir)
+        .map_err(|_| ConfigFetchIssue::NoConfigFound(repo_url.to_string()))?;
     Ok(contents
         .filter_map(|entry| entry.ok().map(|e| PathBuf::from(e.file_name())))
         .filter(looks_like_config_file))
@@ -580,11 +593,11 @@ mod tests {
             config_file_and_rev_from_remote_http("https://github.com/PaoloBiagini/Joan").is_ok()
         );
 
-        let repo_url="https://github.com/googlefonts/bangers";
-        assert!(matches!(
-            config_file_and_rev_from_remote_http(repo_url),
-            Err(ConfigFetchIssue::NoConfigFound(repo_url))
-        ));
+        let repo_url = "https://github.com/googlefonts/BethEllen";
+        match config_file_and_rev_from_remote_http(repo_url) {
+            Err(ConfigFetchIssue::NoConfigFound(s)) => assert_eq!(s, repo_url),
+            _ => panic!("expected no config found"),
+        }
     }
 
     #[test]
