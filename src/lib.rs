@@ -150,7 +150,7 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
     // messages sent from a worker thread
     enum Message {
         Finished(Option<RepoInfo>),
-        ErrorMsg(String),
+        ErrorMsg { repo_url: String, msg: String },
         RateLimit(usize),
     }
 
@@ -179,7 +179,15 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
                             break;
                         }
                         // no configs found or looking for configs failed:
-                        Err(ConfigFetchIssue::NoConfigFound) | Ok(_) => {
+                        Err(ConfigFetchIssue::NoConfigFound(repo_url)) => {
+                            tx.send(Message::ErrorMsg {
+                                repo_url,
+                                msg: "No config found".to_string(),
+                            })
+                            .unwrap();
+                            break;
+                        }
+                        Ok(_) => {
                             tx.send(Message::Finished(None)).unwrap();
                             break;
                         }
@@ -194,12 +202,18 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
                         }
                         Err(e) => {
                             let msg = match e {
+                                ConfigFetchIssue::NoConfigFound(s) => s,
                                 ConfigFetchIssue::BadRepoUrl(s) => s,
                                 ConfigFetchIssue::GitFail(e) => e.to_string(),
                                 ConfigFetchIssue::Http(e) => e.to_string(),
+                                ConfigFetchIssue::HttpErrorResponse(e) => e.to_string(),
+                                ConfigFetchIssue::NonEmptyTargetDir(path) => format!(
+                                    "target directory '{}' exists and is non-empty",
+                                    path.display()
+                                ),
                                 _ => unreachable!(), // handled above
                             };
-                            tx.send(Message::ErrorMsg(msg)).unwrap();
+                            tx.send(Message::ErrorMsg { repo_url, msg }).unwrap();
                             break;
                         }
                     }
@@ -234,8 +248,10 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
                         limit_progress.update(1).unwrap();
                     }
                 }
-                Ok(Message::ErrorMsg(msg)) => {
-                    progressbar.write(msg).unwrap();
+                Ok(Message::ErrorMsg { repo_url, msg }) => {
+                    progressbar
+                        .write(format!("failed to get '{repo_url}': {msg}"))
+                        .unwrap();
                     seen += 1;
                 }
                 Err(e) => {
@@ -245,6 +261,7 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
             }
             progressbar.update(1).unwrap();
         }
+        result.sort_unstable();
         result
     })
 }
@@ -255,12 +272,14 @@ fn find_config_files(fonts: &BTreeSet<Metadata>, git_cache_dir: &Path) -> Vec<Re
 /// RateLimit means we need to wait and retry, other things are errors we report
 #[derive(Debug)]
 enum ConfigFetchIssue {
-    NoConfigFound,
+    NoConfigFound(String),
+    NonEmptyTargetDir(PathBuf),
     RateLimit(usize),
     BadRepoUrl(String),
     // contains stderr
     GitFail(GitFail),
     Http(Box<ureq::Error>),
+    HttpErrorResponse(ureq::http::StatusCode),
 }
 
 /// Checks for a config file in a given repo; also returns git rev
@@ -280,9 +299,16 @@ fn config_files_and_rev_for_repo(
         let config_from_http =
             config_file_and_rev_from_remote_http(repo_url).map(|(p, rev)| (vec![p], rev));
         // if not found, try checking out and looking; otherwise return the result
-        if !matches!(config_from_http, Err(ConfigFetchIssue::NoConfigFound)) {
+        if !matches!(config_from_http, Err(ConfigFetchIssue::NoConfigFound(_))) {
             return config_from_http;
         }
+    }
+    // if the git dir does not exist but the containing dir does, something
+    // probably went wrong on an earlier run; let's wipe the containing dir
+    // and start over.
+    if local_repo_dir.exists() && !local_git_dir.exists() {
+        std::fs::remove_dir(&local_repo_dir)
+            .map_err(|_| ConfigFetchIssue::NonEmptyTargetDir(local_repo_dir.clone()))?;
     }
     let configs = config_files_from_local_checkout(repo_url, &local_repo_dir)?;
     let rev = get_git_rev(&local_repo_dir).map_err(ConfigFetchIssue::GitFail)?;
@@ -300,28 +326,35 @@ fn config_file_and_rev_from_remote_http(
 fn config_file_from_remote_http(repo_url: &str) -> Result<PathBuf, ConfigFetchIssue> {
     for filename in ["config.yaml", "config.yml"] {
         let config_url = format!("{repo_url}/tree/HEAD/sources/{filename}");
-        let req = ureq::head(&config_url);
+        let req = ureq::head(&config_url)
+            .config()
+            .http_status_as_error(false)
+            .build();
 
         match req.call() {
             Ok(resp) if resp.status() == 200 => return Ok(filename.into()),
+            Ok(resp) if resp.status() == 404 => (),
+            Ok(resp) if resp.status() == 429 => {
+                let backoff = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|s| s.to_str().ok().and_then(|s| s.parse::<usize>().ok()))
+                    .unwrap_or(60);
+                return Err(ConfigFetchIssue::RateLimit(backoff));
+            }
+            Ok(resp) if !resp.status().is_success() => {
+                return Err(ConfigFetchIssue::HttpErrorResponse(resp.status()));
+            }
             Ok(resp) => {
                 // seems very unlikely but it feels bad to just skip this branch?
                 log::warn!("unexpected response code for {repo_url}: {}", resp.status());
-            }
-            Err(ureq::Error::Status(404, _)) => (),
-            Err(ureq::Error::Status(429, resp)) => {
-                let backoff = resp
-                    .header("Retry-After")
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(60);
-                return Err(ConfigFetchIssue::RateLimit(backoff));
             }
             Err(e) => {
                 return Err(ConfigFetchIssue::Http(Box::new(e)));
             }
         }
     }
-    Err(ConfigFetchIssue::NoConfigFound)
+    Err(ConfigFetchIssue::NoConfigFound(repo_url.to_string()))
 }
 
 fn config_files_from_local_checkout(
@@ -336,9 +369,9 @@ fn config_files_from_local_checkout(
         std::fs::create_dir_all(local_repo_dir).unwrap();
         clone_repo(repo_url, local_repo_dir).map_err(ConfigFetchIssue::GitFail)?;
     }
-    let configs: Vec<_> = iter_config_paths(local_repo_dir)?.collect();
+    let configs: Vec<_> = iter_config_paths(local_repo_dir, repo_url)?.collect();
     if configs.is_empty() {
-        Err(ConfigFetchIssue::NoConfigFound)
+        Err(ConfigFetchIssue::NoConfigFound(repo_url.to_string()))
     } else {
         Ok(configs)
     }
@@ -349,7 +382,10 @@ fn config_files_from_local_checkout(
 /// This will look for all files that begin with 'config' and have either the
 /// 'yaml' or 'yml' extension; if multiple files match this pattern it will
 /// return the one with the shortest name.
-fn iter_config_paths(font_dir: &Path) -> Result<impl Iterator<Item = PathBuf>, ConfigFetchIssue> {
+fn iter_config_paths(
+    font_dir: &Path,
+    repo_url: &str,
+) -> Result<impl Iterator<Item = PathBuf>, ConfigFetchIssue> {
     #[allow(clippy::ptr_arg)] // we don't use &Path so we can pass this to a closure below
     fn looks_like_config_file(path: &PathBuf) -> bool {
         let (Some(stem), Some(extension)) =
@@ -360,8 +396,10 @@ fn iter_config_paths(font_dir: &Path) -> Result<impl Iterator<Item = PathBuf>, C
         stem.starts_with("config") && (extension == "yaml" || extension == "yml")
     }
 
-    let sources_dir = find_sources_dir(font_dir).ok_or(ConfigFetchIssue::NoConfigFound)?;
-    let contents = std::fs::read_dir(sources_dir).map_err(|_| ConfigFetchIssue::NoConfigFound)?;
+    let sources_dir =
+        find_sources_dir(font_dir).ok_or(ConfigFetchIssue::NoConfigFound(repo_url.to_string()))?;
+    let contents = std::fs::read_dir(sources_dir)
+        .map_err(|_| ConfigFetchIssue::NoConfigFound(repo_url.to_string()))?;
     Ok(contents
         .filter_map(|entry| entry.ok().map(|e| PathBuf::from(e.file_name())))
         .filter(looks_like_config_file))
@@ -393,6 +431,7 @@ fn update_google_fonts_checkout(path: &Path) -> Result<(), Error> {
         std::fs::create_dir_all(path)?;
         clone_repo(GF_REPO_URL, path)?;
     } else {
+        log::info!("fetching latest from {GF_REPO_URL}");
         fetch_latest(path)?;
     }
     Ok(())
@@ -439,8 +478,7 @@ fn get_git_rev_remote(repo_url: &str) -> Result<GitRev, ConfigFetchIssue> {
 /// a git repository)
 fn get_git_rev(repo_path: &Path) -> Result<String, GitFail> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["rev-parse", "--short", "HEAD"])
-        .current_dir(repo_path);
+    cmd.args(["rev-parse", "HEAD"]).current_dir(repo_path);
     let output = cmd.output()?;
 
     if !output.status.success() {
@@ -554,10 +592,12 @@ mod tests {
         assert!(
             config_file_and_rev_from_remote_http("https://github.com/PaoloBiagini/Joan").is_ok()
         );
-        assert!(matches!(
-            config_file_and_rev_from_remote_http("https://github.com/googlefonts/bangers"),
-            Err(ConfigFetchIssue::NoConfigFound)
-        ));
+
+        let repo_url = "https://github.com/googlefonts/BethEllen";
+        match config_file_and_rev_from_remote_http(repo_url) {
+            Err(ConfigFetchIssue::NoConfigFound(s)) => assert_eq!(s, repo_url),
+            _ => panic!("expected no config found"),
+        }
     }
 
     #[test]
